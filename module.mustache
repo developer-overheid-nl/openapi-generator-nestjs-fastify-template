@@ -1,0 +1,94 @@
+import "reflect-metadata";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, Module } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { FastifyAdapter, NestFastifyApplication } from "@nestjs/platform-fastify";
+import cors from "@fastify/cors";
+import { ApiModule } from "./api.module";
+
+const yaml = require("js-yaml") as { load(input: string): unknown };
+
+const parseInt10 = (value: string | undefined, fallback: number): number => {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const statusText = (status: number): string => {
+  const texts: Record<number, string> = {
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    409: "Conflict",
+    415: "Unsupported Media Type",
+    422: "Unprocessable Entity",
+    429: "Too Many Requests",
+    500: "Internal Server Error",
+    501: "Not Implemented",
+    502: "Bad Gateway",
+    503: "Service Unavailable",
+    504: "Gateway Timeout",
+  };
+  return texts[status] ?? "Unknown Error";
+};
+
+const toProblem = (status: number, detail: string, instance?: string) => ({
+  type: `https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/${status}`,
+  title: statusText(status),
+  status,
+  detail,
+  instance,
+});
+
+@Catch()
+class ProblemDetailsFilter implements ExceptionFilter {
+  catch(error: unknown, host: ArgumentsHost) {
+    const context = host.switchToHttp();
+    const request = context.getRequest<{ url?: string }>();
+    const reply = context.getResponse();
+    const status = error instanceof HttpException ? error.getStatus() : 500;
+    const response = error instanceof HttpException ? error.getResponse() : undefined;
+    const detail =
+      typeof response === "object" && response !== null && "message" in response
+        ? Array.isArray((response as { message?: unknown }).message)
+          ? (response as { message: unknown[] }).message.join(", ")
+          : String((response as { message?: unknown }).message)
+        : error instanceof Error
+          ? error.message
+          : statusText(status);
+
+    reply.status(status).type("application/problem+json").send(toProblem(status, detail, request.url));
+  }
+}
+
+@Module({
+  imports: [ApiModule.forRoot()],
+})
+class AppModule {}
+
+const bootstrap = async () => {
+  const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter({ bodyLimit: 14 * 1024 * 1024 }));
+  await app.register(cors);
+  app.useGlobalFilters(new ProblemDetailsFilter());
+
+  const openapiYaml = readFileSync(join(process.cwd(), "api", "openapi.yaml"), "utf8");
+  const openapiDocument = yaml.load(openapiYaml);
+  const apiVersion =
+    typeof openapiDocument === "object" && openapiDocument !== null && "info" in openapiDocument
+      ? (openapiDocument as { info?: { version?: string } }).info?.version
+      : undefined;
+  const fastify = app.getHttpAdapter().getInstance();
+  fastify.addHook("onSend", async (_request, reply, payload) => {
+    if (apiVersion && !reply.getHeader("API-Version")) reply.header("API-Version", apiVersion);
+    return payload;
+  });
+  fastify.get("/openapi.yaml", async (_request, reply) => reply.type("text/yaml; charset=utf-8").send(openapiYaml));
+  fastify.get("/openapi.json", async () => openapiDocument);
+
+  await app.listen(parseInt10(process.env.PORT, 1338), process.env.HOST ?? "0.0.0.0");
+};
+
+bootstrap();

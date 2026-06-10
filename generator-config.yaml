@@ -1,0 +1,4 @@
+files:
+  openapi.mustache:
+    templateType: SupportingFiles
+    destinationFilename: api/openapi.yaml

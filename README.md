@@ -1,33 +1,165 @@
 # OpenAPI Generator NestJS Fastify Template
 
-Template for the standard OpenAPI Generator flow with `typescript-nestjs-server`.
+Template voor het genereren van een startbare TypeScript API-applicatie vanuit
+een OpenAPI-specificatie.
 
-Use the wrapper script when you want a complete runnable project. It calls OpenAPI Generator and copies the input OAS into the generated output as `api/openapi.yaml`.
+De basis is de officiële OpenAPI Generator generator
+`typescript-nestjs-server`. Deze template past de gegenereerde output aan zodat
+de applicatie direct draait met **NestJS op de Fastify adapter**.
+
+## Wat Gebruiken We?
+
+- **Generator tool:** `@openapitools/openapi-generator-cli`
+- **OpenAPI Generator generator:** `typescript-nestjs-server`
+- **Applicatieframework:** NestJS
+- **HTTP server/runtime:** Fastify via `@nestjs/platform-fastify`
+- **Taal:** TypeScript
+
+De generator maakt controllers, API interfaces en model types op basis van de
+OpenAPI-specificatie. De template voegt daar een startbare applicatie omheen:
+bootstrap, Fastify adapter, scripts, problem-details foutafhandeling en
+OpenAPI publicatie endpoints.
+
+## Waarom Niet Alleen `openapi-generator-cli generate`?
+
+De officiële `typescript-nestjs-server` generator genereert vooral een NestJS
+API-module. Dat is bruikbaar als library, maar nog geen complete applicatie die
+je direct kunt starten.
+
+Daarnaast geeft OpenAPI Generator de ruwe input-specificatie niet betrouwbaar
+door aan supporting-file templates. Daardoor kan de template zelf niet altijd
+correct `api/openapi.yaml` vullen.
+
+Daarom staat er een kleine wrapper:
+
+```text
+generate.sh
+```
+
+Die doet twee dingen:
+
+1. Roept `npx @openapitools/openapi-generator-cli generate` aan met de juiste
+   generator, template en config.
+2. Kopieert de input-OAS naar de gegenereerde applicatie als
+   `api/openapi.yaml`.
+
+Zo blijft het gebruik simpel en is de gegenereerde output compleet.
+
+## Gebruik
 
 ```sh
 ./openapi-generator-nestjs-fastify-template/generate.sh \
   -i tools.openapi.yaml \
-  -o ./tools-api-nest \
-  --name tools-api-nest
+  -o ./tools-api \
+  --name tools-api
 ```
 
-Then:
+Daarna:
 
 ```sh
-cd tools-api-nest
+cd tools-api
 npm run init-install
 npm run dev
 ```
 
-Under the hood the script runs:
+De applicatie start standaard op poort `1338`. Dit kan worden overschreven met
+`PORT`.
+
+```sh
+PORT=8080 npm run dev
+```
+
+## Wat Genereert Dit?
+
+De output bevat onder andere:
+
+```text
+api/openapi.yaml
+api/*.ts
+controllers/*.controller.ts
+models/*.ts
+api.module.ts
+api-implementations.ts
+index.ts
+package.json
+tsconfig.json
+```
+
+Belangrijke runtime endpoints:
+
+- `/openapi.yaml`
+- `/openapi.json`
+- alle paden uit de OpenAPI-specificatie
+
+Nog niet geimplementeerde operations geven standaard:
+
+```http
+501 application/problem+json
+```
+
+## Wat Doet De Template Wel En Niet?
+
+Wel:
+
+- Routes en types genereren vanuit de OpenAPI-specificatie.
+- Een startbare NestJS applicatie genereren.
+- NestJS laten draaien op Fastify.
+- `application/problem+json` gebruiken voor fouten.
+- `API-Version` header vullen vanuit `info.version`.
+- OpenAPI publiceren als YAML en JSON.
+- Standaard 501-responses leveren voor ontbrekende implementaties.
+
+Niet:
+
+- Domeinlogica genereren.
+- Automatisch business packages koppelen.
+- Volledige OpenAPI runtime validatie afdwingen zoals `fastify-openapi-glue`
+  dat doet.
+
+Implementaties moeten dus nog worden gekoppeld via `ApiModule.forRoot`.
+
+## Onderliggend Commando
+
+`generate.sh` voert in essentie dit uit:
 
 ```sh
 npx @openapitools/openapi-generator-cli generate \
   -i tools.openapi.yaml \
   -g typescript-nestjs-server \
-  -o ./tools-api-nest \
+  -o ./tools-api \
   -t ./openapi-generator-nestjs-fastify-template \
-  --additional-properties=npmName=tools-api-nest,npmVersion=1.0.0,nestVersion=11.0.0,tsVersion=5.9.3
+  -c ./openapi-generator-nestjs-fastify-template/generator-config.yaml \
+  --additional-properties=npmName=tools-api,npmVersion=1.0.0,nestVersion=11.0.0,tsVersion=5.9.3
 ```
 
-The generated project is runnable. Operations return `501 application/problem+json` until real implementations are wired into `ApiModule.forRoot`.
+Daarna kopieert het script:
+
+```sh
+cp tools.openapi.yaml ./tools-api/api/openapi.yaml
+```
+
+## Implementaties Koppelen
+
+De generator maakt abstracte API classes, bijvoorbeeld `ToolsApi`. Standaard
+krijgt iedere operation een 501-response. Voor echte implementaties maak je een
+service die de gegenereerde API class implementeert en geef je die door aan
+`ApiModule.forRoot`.
+
+Conceptueel:
+
+```ts
+@Module({
+  imports: [
+    ApiModule.forRoot({
+      apiImplementations: {
+        toolsApi: ToolsService,
+      },
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+In deze template staat de default bootstrap in `index.ts`. Voor een concreet
+project kan die bootstrap worden aangepast zodat de juiste implementaties worden
+geregistreerd.

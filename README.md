@@ -89,7 +89,7 @@ met AJV-details in `errors`.
 Mocking kan worden aangezet zonder implementaties te schrijven:
 
 ```sh
-OPENAPI_MOCK=true npm run dev
+npm run dev-mock
 ```
 
 In mock-mode blijft request-validatie actief. Alleen geldige requests krijgen

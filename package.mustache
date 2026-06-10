@@ -8,6 +8,7 @@
   "scripts": {
     "init-install": "npm install",
     "dev": "tsx watch index.ts",
+    "dev-mock": "OPENAPI_MOCK=true npm run dev",
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"

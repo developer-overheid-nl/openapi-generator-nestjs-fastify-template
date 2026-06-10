@@ -13,12 +13,15 @@ de applicatie direct draait met **NestJS op de Fastify adapter**.
 - **OpenAPI Generator generator:** `typescript-nestjs-server`
 - **Applicatieframework:** NestJS
 - **HTTP server/runtime:** Fastify via `@nestjs/platform-fastify`
+- **OpenAPI runtime:** `openapi-backend`
 - **Taal:** TypeScript
 
 De generator maakt controllers, API interfaces en model types op basis van de
 OpenAPI-specificatie. De template voegt daar een startbare applicatie omheen:
 bootstrap, Fastify adapter, scripts, problem-details foutafhandeling en
-OpenAPI publicatie endpoints.
+OpenAPI publicatie endpoints. Tijdens runtime wordt dezelfde OAS opnieuw
+geladen door `openapi-backend` voor request-validatie, route matching en
+optionele mock-responses.
 
 ## Waarom Niet Alleen `openapi-generator-cli generate`?
 
@@ -69,6 +72,41 @@ De applicatie start standaard op poort `1338`. Dit kan worden overschreven met
 PORT=8080 npm run dev
 ```
 
+### Runtime Opties
+
+Request-validatie staat standaard aan. De gegenereerde applicatie valideert:
+
+- route en HTTP methode;
+- request media type tegen `requestBody.content`;
+- path, query, header, cookie en body schemas;
+- bekende JSON schema formats via `ajv-formats`.
+
+Fouten worden teruggegeven als `application/problem+json`. Een request naar een
+bestaand pad met een verkeerde methode geeft bijvoorbeeld `405` met een
+`Allow` header. Een verkeerd media type geeft `415`. Schemafouten geven `400`
+met AJV-details in `errors`.
+
+Mocking kan worden aangezet zonder implementaties te schrijven:
+
+```sh
+OPENAPI_MOCK=true npm run dev
+```
+
+In mock-mode blijft request-validatie actief. Alleen geldige requests krijgen
+een mock-response op basis van OpenAPI examples of response schemas.
+
+Response-validatie is optioneel:
+
+```sh
+OPENAPI_VALIDATE_RESPONSES=true npm run dev
+```
+
+Deze mode valideert statuscodes, response bodies en response headers tegen de
+OAS. Hij staat niet standaard aan omdat de gegenereerde basisapp ontbrekende
+implementaties als `501` teruggeeft. Als een operation geen `501` response in de
+OAS declareert, is dat in response-validatie mode terecht een contractfout
+(`502`).
+
 ## Wat Genereert Dit?
 
 De output bevat onder andere:
@@ -107,14 +145,15 @@ Wel:
 - `application/problem+json` gebruiken voor fouten.
 - `API-Version` header vullen vanuit `info.version`.
 - OpenAPI publiceren als YAML en JSON.
+- Runtime request-validatie afdwingen vanuit de OAS.
+- Optioneel mock-responses leveren vanuit OpenAPI examples/schemas.
+- Optioneel response bodies en headers valideren vanuit de OAS.
 - Standaard 501-responses leveren voor ontbrekende implementaties.
 
 Niet:
 
 - Domeinlogica genereren.
 - Automatisch business packages koppelen.
-- Volledige OpenAPI runtime validatie afdwingen zoals `fastify-openapi-glue`
-  dat doet.
 
 Implementaties moeten dus nog worden gekoppeld via `ApiModule.forRoot`.
 

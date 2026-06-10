@@ -5,14 +5,45 @@ import { ArgumentsHost, Catch, ExceptionFilter, HttpException, Module } from "@n
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, NestFastifyApplication } from "@nestjs/platform-fastify";
 import cors from "@fastify/cors";
+import addFormats from "ajv-formats";
+import { OpenAPIBackend } from "openapi-backend";
+import type { Operation, Request as OpenAPIRequest } from "openapi-backend";
+import type Ajv from "ajv";
 import { ApiModule } from "./api.module";
 
 const yaml = require("js-yaml") as { load(input: string): unknown };
+
+type RuntimeOpenAPIRequest = OpenAPIRequest & {
+  path: string;
+};
+
+type RuntimeOperation = Operation & {
+  operationId?: string;
+  path: string;
+  method: string;
+  requestBody?: {
+    content?: Record<string, unknown>;
+  };
+  responses?: Record<string, unknown>;
+};
+
+type ValidationError = {
+  instancePath?: string;
+  schemaPath?: string;
+  keyword?: string;
+  params?: unknown;
+  message?: string;
+};
 
 const parseInt10 = (value: string | undefined, fallback: number): number => {
   if (!value) return fallback;
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const parseBoolean = (value: string | undefined): boolean => {
+  if (!value) return false;
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 };
 
 const statusText = (status: number): string => {
@@ -35,13 +66,67 @@ const statusText = (status: number): string => {
   return texts[status] ?? "Unknown Error";
 };
 
-const toProblem = (status: number, detail: string, instance?: string) => ({
+const toProblem = (status: number, detail: string, instance?: string, errors?: ValidationError[]) => ({
   type: `https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/${status}`,
   title: statusText(status),
   status,
   detail,
   instance,
+  ...(errors?.length ? { errors } : {}),
 });
+
+const escapeRegExp = (input: string): string => input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const openApiPathToRegExp = (path: string): RegExp => {
+  const source = path
+    .split("/")
+    .map((part) => (part.startsWith("{") && part.endsWith("}") ? "[^/]+" : escapeRegExp(part)))
+    .join("/");
+  return new RegExp(`^${source}/?$`);
+};
+
+const toHeaderRecord = (headers: Record<string, unknown>): Record<string, string | string[]> => {
+  const result: Record<string, string | string[]> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (Array.isArray(value)) result[key] = value.map(String);
+    else if (value !== undefined) result[key] = String(value);
+  }
+  return result;
+};
+
+const isPublicOpenApiEndpoint = (path: string): boolean => {
+  const cleanPath = path.split("?")[0] ?? path;
+  return cleanPath === "/openapi.yaml" || cleanPath === "/openapi.json";
+};
+
+const isJsonLikeContentType = (contentType: unknown): boolean =>
+  typeof contentType === "string" && /\bjson\b/i.test(contentType);
+
+const normalizeMediaType = (contentType: string): string => contentType.split(";")[0]?.trim().toLowerCase() ?? "";
+
+const mediaTypeMatches = (actual: string, expected: string): boolean => {
+  const normalizedActual = normalizeMediaType(actual);
+  const normalizedExpected = normalizeMediaType(expected);
+  if (normalizedActual === normalizedExpected) return true;
+  if (normalizedExpected === "*/*") return true;
+  const [expectedType, expectedSubtype] = normalizedExpected.split("/");
+  const [actualType, actualSubtype] = normalizedActual.split("/");
+  if (!expectedType || !expectedSubtype || !actualType || !actualSubtype) return false;
+  if (expectedSubtype === "*") return expectedType === actualType;
+  return expectedSubtype.startsWith("*+") && actualSubtype.endsWith(expectedSubtype.slice(1)) && expectedType === actualType;
+};
+
+const hasUnsupportedRequestMediaType = (operation: RuntimeOperation, contentType: unknown, body: unknown): boolean => {
+  const allowedMediaTypes = Object.keys(operation.requestBody?.content ?? {});
+  if (allowedMediaTypes.length === 0 || body === undefined) return false;
+  if (typeof contentType !== "string" || contentType.trim() === "") return true;
+  return !allowedMediaTypes.some((mediaType) => mediaTypeMatches(contentType, mediaType));
+};
+
+const isDeclaredResponseStatus = (operation: RuntimeOperation, statusCode: number): boolean => {
+  const responses = operation.responses ?? {};
+  return String(statusCode) in responses || `${Math.floor(statusCode / 100)}XX` in responses || "default" in responses;
+};
 
 @Catch()
 class ProblemDetailsFilter implements ExceptionFilter {
@@ -76,13 +161,132 @@ const bootstrap = async () => {
 
   const openapiYaml = readFileSync(join(process.cwd(), "api", "openapi.yaml"), "utf8");
   const openapiDocument = yaml.load(openapiYaml);
+  const openapi = new OpenAPIBackend({
+    definition: openapiDocument as never,
+    validate: true,
+    coerceTypes: true,
+    ajvOpts: {
+      allErrors: true,
+      strict: false,
+    },
+    customizeAjv: (ajv: Ajv) => addFormats(ajv),
+  });
+  await openapi.init();
+
   const apiVersion =
     typeof openapiDocument === "object" && openapiDocument !== null && "info" in openapiDocument
       ? (openapiDocument as { info?: { version?: string } }).info?.version
       : undefined;
+  const mockResponses = parseBoolean(process.env.OPENAPI_MOCK);
+  const validateResponses = parseBoolean(process.env.OPENAPI_VALIDATE_RESPONSES);
+  const operations = openapi.getOperations() as RuntimeOperation[];
+  const operationPaths = operations.map((operation) => ({
+    operation,
+    pathPattern: openApiPathToRegExp(operation.path),
+  }));
+
   const fastify = app.getHttpAdapter().getInstance();
+
+  fastify.addHook("preValidation", async (request, reply) => {
+    if (isPublicOpenApiEndpoint(request.url)) return;
+
+    const openapiRequest: RuntimeOpenAPIRequest = {
+      method: request.method,
+      path: request.url,
+      body: request.body,
+      query: request.query as Record<string, string | string[]> | string | undefined,
+      headers: toHeaderRecord(request.headers),
+    };
+    const operation = openapi.matchOperation(openapiRequest) as RuntimeOperation | undefined;
+
+    if (!operation) {
+      const requestPath = request.url.split("?")[0] ?? request.url;
+      const allowedMethods = operationPaths
+        .filter(({ pathPattern }) => pathPattern.test(requestPath))
+        .map(({ operation: candidate }) => candidate.method.toUpperCase());
+
+      if (allowedMethods.length > 0) {
+        reply.header("Allow", [...new Set(allowedMethods)].sort().join(", "));
+        return reply
+          .status(405)
+          .type("application/problem+json")
+          .send(toProblem(405, `Method ${request.method} is not allowed for ${requestPath}`, request.url));
+      }
+      return;
+    }
+
+    const operationId = operation.operationId;
+    if (hasUnsupportedRequestMediaType(operation, request.headers["content-type"], request.body)) {
+      return reply
+        .status(415)
+        .type("application/problem+json")
+        .send(toProblem(415, "Request content type is not supported by the OpenAPI operation", request.url));
+    }
+
+    const validation = openapi.validateRequest(openapiRequest, operationId);
+    if (!validation.valid) {
+      const status = validation.errors?.some((error) => error.keyword === "contentType") ? 415 : 400;
+      return reply
+        .status(status)
+        .type("application/problem+json")
+        .send(toProblem(status, "Request does not match the OpenAPI specification", request.url, validation.errors ?? undefined));
+    }
+
+    (request as { openapiOperation?: RuntimeOperation }).openapiOperation = operation;
+
+    if (mockResponses) {
+      if (!operationId) {
+        return reply
+          .status(501)
+          .type("application/problem+json")
+          .send(toProblem(501, "Operation has no operationId and cannot be mocked", request.url));
+      }
+      const mocked = openapi.mockResponseForOperation(operationId);
+      return reply.status(mocked.status).send(mocked.mock);
+    }
+  });
+
   fastify.addHook("onSend", async (_request, reply, payload) => {
     if (apiVersion && !reply.getHeader("API-Version")) reply.header("API-Version", apiVersion);
+    return payload;
+  });
+  fastify.addHook("onSend", async (request, reply, payload) => {
+    if (!validateResponses) return payload;
+    if (isPublicOpenApiEndpoint(request.url)) return payload;
+
+    const operation = (request as { openapiOperation?: RuntimeOperation }).openapiOperation;
+    const operationId = operation?.operationId;
+    if (!operationId) return payload;
+
+    const statusCode = reply.statusCode;
+    if (!isDeclaredResponseStatus(operation, statusCode)) {
+      reply.status(502).type("application/problem+json");
+      return JSON.stringify(toProblem(502, `Response status ${statusCode} is not declared in the OpenAPI specification`, request.url));
+    }
+
+    const contentType = reply.getHeader("content-type");
+    const responseBody =
+      typeof payload === "string" && isJsonLikeContentType(contentType)
+        ? JSON.parse(payload)
+        : payload;
+    const bodyValidation = openapi.validateResponse(responseBody, operationId, statusCode);
+    if (!bodyValidation.valid) {
+      reply.status(502).type("application/problem+json");
+      return JSON.stringify(
+        toProblem(502, "Response body does not match the OpenAPI specification", request.url, bodyValidation.errors ?? undefined),
+      );
+    }
+
+    const headerValidation = openapi.validateResponseHeaders(reply.getHeaders(), operationId, {
+      statusCode,
+    });
+    if (!headerValidation.valid) {
+      reply.status(502).type("application/problem+json");
+      return JSON.stringify(
+        toProblem(502, "Response headers do not match the OpenAPI specification", request.url, headerValidation.errors ?? undefined),
+      );
+    }
+
     return payload;
   });
   fastify.get("/openapi.yaml", async (_request, reply) => reply.type("text/yaml; charset=utf-8").send(openapiYaml));

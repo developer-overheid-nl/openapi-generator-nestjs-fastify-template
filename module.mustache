@@ -94,10 +94,13 @@ const toHeaderRecord = (headers: Record<string, unknown>): Record<string, string
   return result;
 };
 
-const isPublicOpenApiEndpoint = (path: string): boolean => {
-  const cleanPath = path.split("?")[0] ?? path;
-  return cleanPath === "/openapi.yaml" || cleanPath === "/openapi.json";
-};
+const hasOpenApiPath = (document: unknown, path: string): boolean =>
+  typeof document === "object" &&
+  document !== null &&
+  "paths" in document &&
+  typeof (document as { paths?: unknown }).paths === "object" &&
+  (document as { paths: Record<string, unknown> }).paths !== null &&
+  path in (document as { paths: Record<string, unknown> }).paths;
 
 const isJsonLikeContentType = (contentType: unknown): boolean =>
   typeof contentType === "string" && /\bjson\b/i.test(contentType);
@@ -163,6 +166,7 @@ const bootstrap = async () => {
   const openapiDocument = yaml.load(openapiYaml);
   const openapi = new OpenAPIBackend({
     definition: openapiDocument as never,
+    quick: true,
     validate: true,
     coerceTypes: true,
     ajvOpts: {
@@ -184,11 +188,15 @@ const bootstrap = async () => {
     operation,
     pathPattern: openApiPathToRegExp(operation.path),
   }));
+  const generatedOpenApiPaths = new Set<string>();
+  if (!hasOpenApiPath(openapiDocument, "/openapi.yaml")) generatedOpenApiPaths.add("/openapi.yaml");
+  if (!hasOpenApiPath(openapiDocument, "/openapi.json")) generatedOpenApiPaths.add("/openapi.json");
+  const isGeneratedOpenApiEndpoint = (path: string): boolean => generatedOpenApiPaths.has(path.split("?")[0] ?? path);
 
   const fastify = app.getHttpAdapter().getInstance();
 
   fastify.addHook("preValidation", async (request, reply) => {
-    if (isPublicOpenApiEndpoint(request.url)) return;
+    if (isGeneratedOpenApiEndpoint(request.url)) return;
 
     const openapiRequest: RuntimeOpenAPIRequest = {
       method: request.method,
@@ -252,7 +260,7 @@ const bootstrap = async () => {
   });
   fastify.addHook("onSend", async (request, reply, payload) => {
     if (!validateResponses) return payload;
-    if (isPublicOpenApiEndpoint(request.url)) return payload;
+    if (isGeneratedOpenApiEndpoint(request.url)) return payload;
 
     const operation = (request as { openapiOperation?: RuntimeOperation }).openapiOperation;
     const operationId = operation?.operationId;
@@ -289,8 +297,12 @@ const bootstrap = async () => {
 
     return payload;
   });
-  fastify.get("/openapi.yaml", async (_request, reply) => reply.type("text/yaml; charset=utf-8").send(openapiYaml));
-  fastify.get("/openapi.json", async () => openapiDocument);
+  if (generatedOpenApiPaths.has("/openapi.yaml")) {
+    fastify.get("/openapi.yaml", async (_request, reply) => reply.type("text/yaml; charset=utf-8").send(openapiYaml));
+  }
+  if (generatedOpenApiPaths.has("/openapi.json")) {
+    fastify.get("/openapi.json", async () => openapiDocument);
+  }
 
   await app.listen(parseInt10(process.env.PORT, 1338), process.env.HOST ?? "0.0.0.0");
 };

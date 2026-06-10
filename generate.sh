@@ -47,8 +47,48 @@ if [[ -z "$INPUT" || -z "$OUTPUT" ]]; then
   exit 2
 fi
 
+CODEGEN_INPUT="$INPUT"
+TEMP_CODEGEN_INPUT=""
+cleanup() {
+  if [[ -n "$TEMP_CODEGEN_INPUT" && -f "$TEMP_CODEGEN_INPUT" ]]; then
+    rm -f "$TEMP_CODEGEN_INPUT"
+  fi
+}
+trap cleanup EXIT
+
+if command -v node >/dev/null 2>&1; then
+  TEMP_CODEGEN_INPUT="$(mktemp "${TMPDIR:-/tmp}/openapi-codegen-input.XXXXXX")"
+  if node - "$INPUT" "$TEMP_CODEGEN_INPUT" <<'NODE'
+const { readFileSync, writeFileSync } = require("node:fs");
+
+const input = process.argv[2];
+const output = process.argv[3];
+const document = JSON.parse(readFileSync(input, "utf8"));
+const methods = new Set(["get", "put", "post", "delete", "options", "head", "patch", "trace"]);
+
+for (const pathItem of Object.values(document.paths ?? {})) {
+  if (!pathItem || typeof pathItem !== "object") continue;
+  for (const [method, operation] of Object.entries(pathItem)) {
+    if (!methods.has(method) || !operation || typeof operation !== "object") continue;
+    if (Array.isArray(operation.tags) && operation.tags.length > 1) {
+      operation.tags = [operation.tags[0]];
+    }
+  }
+}
+
+writeFileSync(output, `${JSON.stringify(document, null, 2)}\n`);
+NODE
+  then
+    CODEGEN_INPUT="$TEMP_CODEGEN_INPUT"
+  else
+    echo "Warning: could not normalize operation tags for code generation; using original input." >&2
+    rm -f "$TEMP_CODEGEN_INPUT"
+    TEMP_CODEGEN_INPUT=""
+  fi
+fi
+
 npx @openapitools/openapi-generator-cli generate \
-  -i "$INPUT" \
+  -i "$CODEGEN_INPUT" \
   -g typescript-nestjs-server \
   -o "$OUTPUT" \
   -t "$TEMPLATE_DIR" \
